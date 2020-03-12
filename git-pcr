@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+
+import sys, json, argparse
+import subprocess
+import re
+import getpass
+import traceback
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+sys.path.insert(0, '/home/diennea.lan/nicolo.boschi/dev/magnews/devutils')
+
+from python_utils import utils
+
+JIRA_API_BASE = "https://jiramn.diennea.lan"
+
+SKIP_REBASE = False
+SKIP_PUSH = False
+FORCE_PUSH = False
+
+def extract_jira_issue_ids(string): 
+    return re.findall("[A-Z]{1,}-[0-9]{1,}", string)
+
+def ok(string):
+    print('\x1b[0;32;40m' + string + '\x1b[0m')
+
+def info(string):
+    print('\x1b[0;36;40m' + string + '\x1b[0m')
+    
+def error(string):
+    print('\x1b[0;31;40m' + string + '\x1b[0m')
+
+def push(force):
+    push_commands = ["git", "push", "origin", utils.get_current_branch()]
+    if force:
+        push_commands.append("--force")
+    thePush = subprocess.call(push_commands)
+    if thePush == 0:
+        ok("PUSH OK!, FORCE=" + str(force))
+        return 0
+    else:
+        error("PUSH FAILED!")
+        if not force:
+            force = input("Push force? :D [y]")
+            if force.lower() == "y" or force == "":
+                return push(True)
+    return 1   
+    
+def check_commit_and_branch():
+    branch = utils.get_current_branch()
+    info("BRANCH : %s" % branch)
+    if branch == 'master':
+        return False
+    branch_jiraids = extract_jira_issue_ids(branch)
+    if not branch_jiraids or len(branch_jiraids) != 1:
+        return False
+    branch_jiraid = branch_jiraids[0]
+    commits = subprocess.check_output(("git log --pretty=format:%%s --abbrev-commit origin/master..%s" % branch).split(" ")).decode().split("\n")
+    if not commits or len(commits) == 0:
+        return True
+    for c in commits:
+        info("COMMIT : %s" % c)
+        ids = extract_jira_issue_ids(c)
+        if ids and len(ids) == 1:
+            if branch_jiraid == ids[0]:
+                return True
+    return False
+
+
+def main():
+    if not utils.is_git_repository():
+        print("Not a git repository")
+        return 1
+    
+    username = utils.get_pc_username()
+    pwd = utils.get_store_password_from_secret_tool('jirarestapi')
+
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worklog', metavar='WLOG', default="1")
+    parser.add_argument('--no-rebase', type=bool, help='skip rebase', default=False, const=True, nargs='?')
+    
+    args = parser.parse_args()
+    SKIP_REBASE = args.no_rebase
+
+    checkok = check_commit_and_branch()
+    if not checkok:
+        error("CHECK BRANCH AND COMMIT FAILED")
+        #exit(1)
+    else:
+        ok("CHECK BRANCH AND COMMIT OK")
+    
+
+    if not SKIP_REBASE:
+        rebase = utils.call_cmd(["git", "rebase", "origin/master"])
+        if rebase:
+            ok("REBASE OK!")
+        else:
+            error("REBASE FAILED!")
+            exit(1) 
+    else:
+        info("REBASE SKIPPED!")
+
+    if not SKIP_PUSH:
+        _push = push(FORCE_PUSH)
+        if _push == 1:
+            exit(1)
+    else:
+        info("PUSH SKIPPED!")
+    
+    current = utils.get_current_branch()
+
+    issue = extract_jira_issue_ids(current)[0];
+    print("Issue %s" % issue)
+    print("Try to connect to jira, url: %s" % JIRA_API_BASE)
+    timespent = args.worklog
+    print("Ok, your job stops here...")
+    try:
+        base_url = JIRA_API_BASE + "/rest/api/2/issue/"+issue
+        r = requests.get(base_url, auth=(username,pwd), verify=False)
+        jiraissue = json.loads(str(r.text))
+        actual_status = jiraissue['fields']['status']['name']
+        data = {}
+        done = False
+        if actual_status == "Open":
+            data["transition"] = {"id": "4"} 
+            r = requests.post(base_url + "/transitions", 
+                auth=(username,pwd), 
+                verify=False, data = json.dumps(data), 
+                headers = {'Content-type': 'application/json'})
+            r.raise_for_status()
+            done = True
+            
+        if done or actual_status == "In Progress":
+            data = {}
+            if len(timespent) > 0:
+                data["update"] = {"worklog": [{"add": {"timeSpent": timespent}}] } #Worklog
+            data["transition"] = {"id": "711"} #Ready for Review
+            r = requests.post(base_url + "/transitions", 
+                    auth=(username,pwd), 
+                    verify=False, data = json.dumps(data), 
+                    headers = {'Content-type': 'application/json'})
+            r.raise_for_status()
+        else: 
+            error("ISSUE %s not in code review, in %s" % (issue, actual_status))
+            
+        ok("JIRA CODE REVIEW OK!")
+    except Exception as e:
+        traceback.print_exc()
+        error(str(e))
+        error("JIRA CODE REVIEW FAILED!")
+        return 1
+
+if __name__ == "__main__":
+    exit(main())
+

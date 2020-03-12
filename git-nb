@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import sys
+import base64
+import jira.client
+
+import utils
+
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+REMOTE_NAME = os.environ.get("NEW_BRANCH_REMOTE_NAME", "origin")
+JIRA_API_BASE = "https://jiramn.diennea.lan"
+
+jira_issue=None
+
+def clean_up(original_head, created_branch):
+    print("\n" + utils.green("=== CLEAN UP ==="))
+    if not original_head is None and original_head != utils.get_current_branch():
+        print("Restoring head pointer to %s" % original_head)
+        utils.run_cmd("git checkout %s" % original_head)
+    
+    if not created_branch is None:
+        print("Deleting new branch %s")
+        utils.run_cmd("git checkout %s" % original_head)
+
+    print(utils.green("=== END CLEAN UP ==="))
+
+def quit(original_head, created_branch):
+    clean_up(original_head, created_branch)
+    exit(0)
+
+def branch_prefix_from_issue_type(issue_type):
+    if not issue_type is None:
+        issue_type = issue_type.lower()
+        if issue_type == "bug":
+            return "bugfix/"
+        elif issue_type == "improvement":
+            return "improvement/"
+        elif issue_type == "new feature":
+            return "newfeature/"
+        elif issue_type == "task":
+            return "task/"
+        elif issue_type == "sub-task":
+            return "subtask/"
+        elif issue_type == "test":
+            return "test/"
+    return None
+
+def jira_connect():
+    username = utils.get_pc_username()
+    pwd = str(base64.b64decode(str(open('/home/diennea.lan/nicolo.boschi/.pass', 'r').read().strip()[2:-1])))[2:-1]
+    print("Try to connect to jira, url: %s" % JIRA_API_BASE)
+    try:
+        asf_jira = jira.client.JIRA({'server': JIRA_API_BASE, 'verify': False},
+                                basic_auth=(username, pwd))
+        return asf_jira
+    except jira.exceptions.JIRAError as e:
+        retry = utils.ask_yes_no("Failed to connect to JIRA: %s\nRetry?" % e.text)
+        if retry:
+            jira_connect()
+        else:
+            return None
+
+def get_jira_issue_type(issue_id):
+    asf_jira = jira_connect()
+    if asf_jira is None:
+        print("Cannot connect to jira.")
+        return None
+    try:
+        global jira_issue
+        jira_issue =  asf_jira.issue(issue_id)
+        type = jira_issue.fields.issuetype.name
+        name = branch_prefix_from_issue_type(type)
+        if name is None:
+            print("No mapping for issue type: %s" % type) 
+            return None
+        return name
+    except Exception as e:
+        print("ASF JIRA could not find %s\n%s" % (issue_id, e.text))
+        return None
+
+def ask_issue_type(issue_id, useJira = False):
+    if useJira:
+        print("Using jira")
+        issuetype = get_jira_issue_type(issue_id)
+        if issuetype is None:
+            return ask_issue_type(issue_id)
+        else:
+            return issuetype
+    res = utils.ask("What is the type of issue?\n(0) Ask to JIRA. (1) Bug. (2) Improvement. (3) Feature. (4) Task. : ")
+    if not res in ["0","1","2","3","4"]:
+        return ask_issue_type(issue_id)
+    if res == "0":
+        issuetype = get_jira_issue_type(issue_id)
+        if issuetype is None:
+            return ask_issue_type(issue_id)
+        else:
+            return issuetype
+    if res == "1":
+        return "bugfix/"
+    if res == "2":
+        return "improvement/"
+    if res == "3":
+        return "feature/"
+    if res == "4":
+        return "task/"
+
+def ask_on_already_exists(branch):
+    res = utils.ask("Branch %s already exists.\n(1) Checkout it\t(2) Overwrite with this new branch\t(3) Exit\nSo?: " % branch)
+    if not res in ["1","2","3"]:
+        return ask_on_already_exists(branch)
+    if res == "1":
+        utils.run_cmd("git checkout %s" % branch)
+    elif res == "2":
+        utils.run_cmd("git branch -D %s" % branch)
+        create_branch(branch)
+    elif res == "3":
+        quit(original_head,None)
+        
+
+def create_branch(text):
+    utils.run_cmd("git checkout -b %s %s/master" % (text,REMOTE_NAME))
+    ok = utils.ask_yes_no("Create remote branch and track to it?")
+    if ok:
+        try:
+            utils.run_cmd("git push -u %s %s" % (REMOTE_NAME,text))
+        except e:
+            print(e) 
+
+def add_suffix(actual_name):
+    additional = utils.ask("Do you want to add a suffix to the name of the new branch?:\n%s (-)" % actual_name)
+    if additional != "": 
+        return actual_name + "-" + additional
+    else:
+        return actual_name
+
+def branchify(summary):
+    return re.sub('[^0-9a-zA-Z]+', '-', summary).lower()[:40]
+     
+def get_new_branch_prefix(passed_issue, ask = True):
+    prefix = ask_issue_type(passed_issue, True) if ask else ""
+    text = prefix + passed_issue
+    global jira_issue
+    if jira_issue is not None:
+        newtext = text + "/" + str(branchify(str(jira_issue.fields.summary)))
+    else:
+        newtext = add_suffix(text)
+    ok = utils.ask_yes_no("%s\nIt's okay?" % newtext)
+    if not ok: 
+        jira_issue = None
+        return get_new_branch_prefix(text, False)
+    else:
+        return newtext
+    
+def main():
+    global original_head 
+    global created_branch
+    original_head = None
+    created_branch = None
+    utils.call_cmd("git fetch")
+    try: 
+        stage_area_dirty = utils.stage_area_dirty()
+        if stage_area_dirty: 
+            print("Stage area is dirty!!")
+        passed_issue = None if len(sys.argv) <= 1 else sys.argv[1]
+       
+        if passed_issue is None:
+            print("Issue id required! git nb [ISSUE ID] ")
+            return
+
+        original_head = utils.get_current_branch() 
+        #text = get_new_branch_prefix(passed_issue)
+
+
+        text = "fix/" + passed_issue
+        text += "/" + utils.ask('Additional text? (%s)' % text)
+        exists = utils.call_cmd("git rev-parse --verify %s" % text) == 1
+        if not exists:
+            create_branch(text)
+        else:
+            ask_on_already_exists(text)
+            
+    except (Exception,KeyboardInterrupt):
+        utils.print_exception()
+        clean_up(original_head,created_branch)
+        
+    
+if __name__ == "__main__":
+    main()
+
