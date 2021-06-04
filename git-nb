@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import sys
+import base64
+import utils
+import requests
+
+REMOTE_NAME = os.environ.get("NEW_BRANCH_REMOTE_NAME", "origin")
+
+
+def clean_up(original_head, created_branch):
+    print("\n" + utils.green("=== CLEAN UP ==="))
+    if not original_head is None and original_head != utils.get_current_branch():
+        print("Restoring head pointer to %s" % original_head)
+        utils.run_cmd("git checkout %s" % original_head)
+    
+    if not created_branch is None:
+        print("Deleting new branch %s")
+        utils.run_cmd("git checkout %s" % original_head)
+
+    print(utils.green("=== END CLEAN UP ==="))
+
+def quit(original_head, created_branch):
+    clean_up(original_head, created_branch)
+    exit(0)
+
+def ask_on_already_exists(branch):
+    res = utils.ask("Branch %s already exists.\n(1) Checkout it\t(2) Overwrite with this new branch\t(3) Exit\nSo?: " % branch)
+    if not res in ["1","2","3"]:
+        return ask_on_already_exists(branch)
+    if res == "1":
+        utils.run_cmd("git checkout %s" % branch)
+    elif res == "2":
+        utils.run_cmd("git branch -D %s" % branch)
+        create_branch(branch)
+    elif res == "3":
+        quit(original_head,None)
+        
+
+def create_branch(text):
+    utils.run_cmd("git checkout -b %s %s/master" % (text,REMOTE_NAME))
+    ok = utils.ask_yes_no("Create remote branch and track to it?")
+    if ok:
+        try:
+            utils.run_cmd("git push -u %s %s" % (REMOTE_NAME,text))
+        except e:
+            print(e) 
+
+def main():
+    global original_head 
+    global created_branch
+    original_head = None
+    created_branch = None
+    utils.call_cmd("git fetch")
+    try: 
+        stage_area_dirty = utils.stage_area_dirty()
+        if stage_area_dirty: 
+            print("Stage area is dirty!!")
+        passed_issue = None if len(sys.argv) <= 1 else sys.argv[1]
+       
+        if passed_issue is None:
+            print("Issue id required! git nb [ISSUE ID] ")
+            return
+
+        original_head = utils.get_current_branch() 
+        
+
+
+        text = "fix/" + passed_issue
+        text += "/" + utils.ask('Additional text? (%s)' % text)
+        exists = utils.call_cmd("git rev-parse --verify %s" % text) == 1
+        if not exists:
+            create_branch(text)
+        else:
+            ask_on_already_exists(text)
+            
+    except (Exception,KeyboardInterrupt):
+        utils.print_exception()
+        clean_up(original_head,created_branch)
+        
+    
+if __name__ == "__main__":
+    main()
+

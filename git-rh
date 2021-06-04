@@ -1,0 +1,5 @@
+#!/bin/bash
+git stash save script
+git fetch --all
+git reset --hard origin/master
+
